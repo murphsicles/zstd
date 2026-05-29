@@ -1,0 +1,286 @@
+// Auto-converted from /tmp/df-zstd-0.13.3/zstd-0.13.3/src/stream/write/mod.rs
+
+use std::io::{ self, Write };
+use zstd_safe;
+use crate::dict::{ DecoderDictionary, EncoderDictionary };
+use crate::stream::{ raw, zio };
+#[cfg(test)]
+mod tests;
+/// An encoder that compress and forward data to another writer.
+/// 
+/// This allows to compress a stream of data
+/// (good for files or heavy network stream).
+/// 
+/// Don't forget to call [`finish()`] before dropping it!
+/// 
+/// Alternatively, you can call [`auto_finish()`] to use an
+/// [`AutoFinishEncoder`] that will finish on drop.
+/// 
+/// Note: The zstd library has its own internal input buffer(~128kb).
+/// 
+/// [`finish()`]: #method.finish
+/// [`auto_finish()`]: #method.auto_finish
+/// [`AutoFinishEncoder`]: AutoFinishEncoder
+pub struct Encoder<a, W: Write> {
+ writer: zio::Writer<W, raw::Encoder<'a>>,
+}
+
+/// A decoder that decompress and forward data to another writer.
+/// 
+/// Note that you probably want to `flush()` after writing your stream content.
+/// You can use [`auto_flush()`] to automatically flush the writer on drop.
+/// 
+/// [`auto_flush()`]: Decoder::auto_flush
+pub struct Decoder<a, W: Write> {
+ writer: zio::Writer<W, raw::Decoder<'a>>,
+}
+
+/// A wrapper around an `Encoder<W>` that finishes the stream on drop.
+/// 
+/// This can be created by the [`auto_finish()`] method on the [`Encoder`].
+/// 
+/// [`auto_finish()`]: Encoder::auto_finish
+/// [`Encoder`]: Encoder
+pub struct AutoFinishEncoder<a, W: Write, F: FnMut> {
+ encoder: Option<Encoder<'a, W>>,
+ on_finish: Option<F>,
+}
+
+/// A wrapper around a `Decoder<W>` that flushes the stream on drop.
+/// 
+/// This can be created by the [`auto_flush()`] method on the [`Decoder`].
+/// 
+/// [`auto_flush()`]: Decoder::auto_flush
+/// [`Decoder`]: Decoder
+pub struct AutoFlushDecoder<a, W: Write, F: FnMut> {
+ decoder: Option<Decoder<'a, W>>,
+ on_flush: Option<F>,
+}
+
+impl<a, W: Write, F: FnMut> AutoFlushDecoder<'a, W, F> {
+ fn new(decoder: Decoder<'a, W>, on_flush: F) -> Self {
+ AutoFlushDecoder { decoder: Some(decoder), on_flush: Some(on_flush) }
+ }
+ 
+ pub fn get_ref(&self) -> &W {
+ self.decoder.as_ref().unwrap().get_ref()
+ }
+ 
+ pub fn get_mut(&mut self) -> &mut W {
+ self.decoder.as_mut().unwrap().get_mut()
+ }
+ 
+}
+
+impl<W, F> Drop for AutoFlushDecoder<'_, W, F> where W: Write, F: FnMut {
+ fn drop(&mut self) {
+ let mut decoder = self.decoder.take().unwrap();
+ let result = decoder.flush();
+ if let Some(mut on_finish) = self.on_flush.take() { on_finish(result); }
+ }
+ 
+}
+
+impl<W: Write, F: FnMut> Write for AutoFlushDecoder<'_, W, F> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.decoder.as_mut().unwrap().write(buf)
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ self.decoder.as_mut().unwrap().flush()
+ }
+ 
+}
+
+impl<a, W: Write, F: FnMut> AutoFinishEncoder<'a, W, F> {
+ fn new(encoder: Encoder<'a, W>, on_finish: F) -> Self {
+ AutoFinishEncoder { encoder: Some(encoder), on_finish: Some(on_finish) }
+ }
+ 
+ pub fn get_ref(&self) -> &W {
+ self.encoder.as_ref().unwrap().get_ref()
+ }
+ 
+ pub fn get_mut(&mut self) -> &mut W {
+ self.encoder.as_mut().unwrap().get_mut()
+ }
+ 
+}
+
+impl<W: Write, F: FnMut> Drop for AutoFinishEncoder<'_, W, F> {
+ fn drop(&mut self) {
+ let result = self.encoder.take().unwrap().finish();
+ if let Some(mut on_finish) = self.on_finish.take() { on_finish(result); }
+ }
+ 
+}
+
+impl<W: Write, F: FnMut> Write for AutoFinishEncoder<'_, W, F> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.encoder.as_mut().unwrap().write(buf)
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ self.encoder.as_mut().unwrap().flush()
+ }
+ 
+}
+
+impl<W: Write> Encoder<'static, W> {
+ pub fn new(writer: W, level: i32) -> io::Result<Self> {
+ Self::with_dictionary(writer, level, & [])
+ }
+ 
+ pub fn with_dictionary(writer: W, level: i32, dictionary: &[u8]) -> io::Result<Self> {
+ let encoder = raw::Encoder::with_dictionary(level, dictionary) ?;
+ Ok(Self::with_encoder(writer, encoder))
+ }
+ 
+}
+
+impl<a, W: Write> Encoder<'a, W> {
+ pub fn with_writer(writer: zio::Writer<W, raw::Encoder<'a>>) -> Self {
+ Self { writer }
+ }
+ 
+ pub fn with_encoder(writer: W, encoder: raw::Encoder<'a>) -> Self {
+ let writer = zio::Writer::new(writer, encoder);
+ Self::with_writer(writer)
+ }
+ 
+ pub fn with_context(writer: W, context: &mut zstd_safe::CCtx<'static>) -> Self {
+ let encoder = raw::Encoder::with_context(context);
+ Self::with_encoder(writer, encoder)
+ }
+ 
+ pub fn with_prepared_dictionary(writer: W, dictionary: &EncoderDictionary<'b>) -> io::Result<Self> {
+ let encoder = raw::Encoder::with_prepared_dictionary(dictionary) ?;
+ Ok(Self::with_encoder(writer, encoder))
+ }
+ 
+ pub fn with_ref_prefix(writer: W, level: i32, ref_prefix: &[u8]) -> io::Result<Self> {
+ let encoder = raw::Encoder::with_ref_prefix(level, ref_prefix) ?;
+ Ok(Self::with_encoder(writer, encoder))
+ }
+ 
+ pub fn auto_finish(self) -> AutoFinishEncoder<'a, W> {
+ AutoFinishEncoder { encoder: Some(self), on_finish: None }
+ }
+ 
+ pub fn on_finish(self, f: F) -> AutoFinishEncoder<'a, W, F> {
+ AutoFinishEncoder::new(self, f)
+ }
+ 
+ pub fn get_ref(&self) -> &W {
+ self.writer.writer()
+ }
+ 
+ pub fn get_mut(&mut self) -> &mut W {
+ self.writer.writer_mut()
+ }
+ 
+ pub fn finish(self) -> io::Result<W> {
+ self.try_finish().map_err(| (_, err) | err)
+ }
+ 
+ pub fn try_finish(self) -> Result<W, (Self, io::Error)> {
+ match self.writer.finish() { Ok(()) => Ok(self.writer.into_inner().0), Err(e) => Err((self, e)) }
+ }
+ 
+ pub fn do_finish(&mut self) -> io::Result<()> {
+ self.writer.finish()
+ }
+ 
+ pub fn recommended_input_size() -> usize {
+ zstd_safe::CCtx::in_size()
+ }
+ 
+ // [unsupported impl item]
+}
+
+impl<a, W: Write> Write for Encoder<'a, W> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.writer.write(buf)
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ self.writer.flush()
+ }
+ 
+}
+
+impl<W: Write> Decoder<'static, W> {
+ pub fn new(writer: W) -> io::Result<Self> {
+ Self::with_dictionary(writer, & [])
+ }
+ 
+ pub fn with_dictionary(writer: W, dictionary: &[u8]) -> io::Result<Self> {
+ let decoder = raw::Decoder::with_dictionary(dictionary) ?;
+ Ok(Self::with_decoder(writer, decoder))
+ }
+ 
+}
+
+impl<a, W: Write> Decoder<'a, W> {
+ pub fn with_writer(writer: zio::Writer<W, raw::Decoder<'a>>) -> Self {
+ Decoder { writer }
+ }
+ 
+ pub fn with_decoder(writer: W, decoder: raw::Decoder<'a>) -> Self {
+ let writer = zio::Writer::new(writer, decoder);
+ Decoder { writer }
+ }
+ 
+ pub fn with_prepared_dictionary(writer: W, dictionary: &DecoderDictionary<'b>) -> io::Result<Self> {
+ let decoder = raw::Decoder::with_prepared_dictionary(dictionary) ?;
+ Ok(Self::with_decoder(writer, decoder))
+ }
+ 
+ pub fn get_ref(&self) -> &W {
+ self.writer.writer()
+ }
+ 
+ pub fn get_mut(&mut self) -> &mut W {
+ self.writer.writer_mut()
+ }
+ 
+ pub fn into_inner(self) -> W {
+ self.writer.into_inner().0
+ }
+ 
+ pub fn recommended_input_size() -> usize {
+ zstd_safe::DCtx::in_size()
+ }
+ 
+ pub fn auto_flush(self) -> AutoFlushDecoder<'a, W> {
+ AutoFlushDecoder { decoder: Some(self), on_flush: None }
+ }
+ 
+ pub fn on_flush(self, f: F) -> AutoFlushDecoder<'a, W, F> {
+ AutoFlushDecoder::new(self, f)
+ }
+ 
+ // [unsupported impl item]
+}
+
+impl<W: Write> Write for Decoder<'_, W> {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ self.writer.write(buf)
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ self.writer.flush()
+ }
+ 
+}
+
+fn _assert_traits() {
+ fn _assert_send<T: Send>(_: T) {
+ }
+ 
+ _assert_send(Decoder::new(Vec::new()));
+ _assert_send(Encoder::new(Vec::new(), 1));
+ _assert_send(Decoder::new(Vec::new()).unwrap().auto_flush());
+ _assert_send(Encoder::new(Vec::new(), 1).unwrap().auto_finish())
+}
+

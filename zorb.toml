@@ -1,0 +1,9 @@
+[package]
+name = "@compress/zstd"
+version = "1.0.0"
+description = "Zeta port of zstd v0.13.3"
+authors = ["The Zeta Foundation"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/murphsicles/zstd"
+keywords = ["compress", "zeta", "zstd"]
+categories = ["compress"]

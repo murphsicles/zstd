@@ -1,0 +1,146 @@
+// Auto-converted from /tmp/df-zstd-0.13.3/zstd-0.13.3/src/stream/zio/writer.rs
+
+use std::io::{ self, Write };
+use crate::stream::raw::{ InBuffer, Operation, OutBuffer };
+/// Implements the [`Write`] API around an [`Operation`].
+/// 
+/// This can be used to wrap a raw in-memory operation in a write-focused API.
+/// 
+/// It can be used with either compression or decompression, and forwards the
+/// output to a wrapped `Write`.
+pub struct Writer<W, D> {
+ operation: D,
+ writer: W,
+ offset: usize,
+ buffer: Vec<u8>,
+ finished: bool,
+ finished_frame: bool,
+}
+
+impl<W, D> Writer<W, D> where W: Write, D: Operation {
+ pub fn new(writer: W, operation: D) -> Self {
+ Self::new_with_capacity(writer, operation, 32 * 1024)
+ }
+ 
+ pub fn new_with_capacity(writer: W, operation: D, capacity: usize) -> Self {
+ Self::with_output_buffer(Vec::with_capacity(capacity), writer, operation )
+ }
+ 
+ pub fn with_output_buffer(output_buffer: Vec<u8>, writer: W, operation: D) -> Self {
+ Writer { writer, operation, offset: 0, buffer: output_buffer, finished: false, finished_frame: false }
+ }
+ 
+ pub fn finish(&mut self) -> io::Result<()> {
+ loop { self.write_from_offset() ?; if self.finished { return Ok(()); } let finished_frame = self.finished_frame; let hint = self.with_buffer(| dst, op | op.finish(dst, finished_frame)); self.offset = 0; let hint = hint ?; if hint != 0 &&self.buffer.is_empty() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame" )); } self.finished = hint == 0; }
+ }
+ 
+ fn with_buffer(&mut self, f: F) -> T {
+ self.buffer.clear();
+ let mut output = OutBuffer::around(&mut self.buffer);
+ f(&mut output, &mut self.operation)
+ }
+ 
+ fn write_from_offset(&mut self) -> io::Result<()> {
+ while self.offset<self.buffer.len() { match self.writer.write(&self.buffer [self.offset ..]) { Ok(0) => { return Err(io::Error::new(io::ErrorKind::WriteZero, "writer will not accept any more data" )) } Ok(n) => self.offset += n, Err(ref e) if e.kind() == io::ErrorKind::Interrupted =>(), Err(e) => return Err(e) } }
+ Ok(())
+ }
+ 
+ pub fn into_inner(self) ->(W, D) {
+ (self.writer, self.operation)
+ }
+ 
+ pub fn writer(&self) -> &W {
+ &self.writer
+ }
+ 
+ pub fn writer_mut(&mut self) -> &mut W {
+ &mut self.writer
+ }
+ 
+ pub fn operation(&self) -> &D {
+ &self.operation
+ }
+ 
+ pub fn operation_mut(&mut self) -> &mut D {
+ &mut self.operation
+ }
+ 
+ pub fn offset(&self) -> usize {
+ self.offset
+ }
+ 
+ pub fn buffer(&self) -> &[u8] {
+ &self.buffer
+ }
+ 
+}
+
+impl<W, D> Write for Writer<W, D> where W: Write, D: Operation {
+ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+ if self.finished { return Err(io::Error::new(io::ErrorKind::Other, "encoder is finished" )); }
+ loop { self.write_from_offset() ?; if self.finished_frame { self.operation.reinit() ?; self.finished_frame = false; } let mut src = InBuffer::around(buf); let hint = self.with_buffer(| dst, op | op.run(&mut src, dst)); let bytes_read = src.pos; self.offset = 0; let hint = hint ?; if hint == 0 { self.finished_frame = true; } if bytes_read > 0 || buf.is_empty() { return Ok(bytes_read); } }
+ }
+ 
+ fn flush(&mut self) -> io::Result<()> {
+ let mut finished = self.finished;
+ loop { self.write_from_offset() ?; if finished { break; } let hint = self.with_buffer(| dst, op | op.flush(dst)); self.offset = 0; let hint = hint ?; finished = hint == 0; }
+ self.writer.flush()
+ }
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use super::Writer;
+ use std::io::Write;
+ #[test]
+ fn test_noop() {
+ use crate::stream::raw::NoOp;
+ let input = b"AbcdefghAbcdefgh.";
+ let mut output = Vec::new();
+ { let mut writer = Writer::new(&mut output, NoOp); writer.write_all(input).unwrap(); writer.finish().unwrap(); }
+ assert_eq!(&output, input);
+ }
+ 
+ #[test]
+ fn test_compress() {
+ use crate::stream::raw::Encoder;
+ let input = b"AbcdefghAbcdefgh.";
+ let mut output = Vec::new();
+ { let mut writer = Writer::new(&mut output, Encoder::new(1).unwrap()); writer.write_all(input).unwrap(); writer.finish().unwrap(); }
+ let decoded = crate::decode_all(&output [..]).unwrap();
+ assert_eq!(&decoded, input);
+ }
+ 
+ #[test]
+ fn test_compress_with_capacity() {
+ use crate::stream::raw::Encoder;
+ let input = b"AbcdefghAbcdefgh.";
+ let mut output = Vec::new();
+ { let mut writer = Writer::new_with_capacity(&mut output, Encoder::new(1).unwrap(), 64 ); assert_eq!(writer.buffer.capacity(), 64); writer.write_all(input).unwrap(); writer.finish().unwrap(); }
+ let decoded = crate::decode_all(&output [..]).unwrap();
+ assert_eq!(&decoded, input);
+ }
+ 
+ #[test]
+ fn test_decompress() {
+ use crate::stream::raw::Decoder;
+ let input = b"AbcdefghAbcdefgh.";
+ let compressed = crate::encode_all(&input [..], 1).unwrap();
+ let mut output = Vec::new();
+ { let mut writer = Writer::new(&mut output, Decoder::new().unwrap()); writer.write_all(&compressed).unwrap(); writer.finish().unwrap(); }
+ assert_eq!(&output, input);
+ }
+ 
+ #[test]
+ fn test_decompress_with_capacity() {
+ use crate::stream::raw::Decoder;
+ let input = b"AbcdefghAbcdefgh.";
+ let compressed = crate::encode_all(&input [..], 1).unwrap();
+ let mut output = Vec::new();
+ { let mut writer = Writer::new_with_capacity(&mut output, Decoder::new().unwrap(), 64 ); assert_eq!(writer.buffer.capacity(), 64); writer.write_all(&compressed).unwrap(); writer.finish().unwrap(); }
+ assert_eq!(&output, input);
+ }
+ 
+}
+
